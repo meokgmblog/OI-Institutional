@@ -21,7 +21,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FNO_EXCEL_PATH = os.path.join(BASE_DIR, "FNO all list.xlsx")
 INSTRUMENTS_CSV_PATH = os.path.join(BASE_DIR, "instruments.csv")
 
-# Updated access token provided by user
+# Using your active access token
 ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJIWjYwMzgiLCJqdGkiOiI2YTlhNTdlYmRmZmFlZTE4YjlhZWEwODEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzg4NDk5OTQ3LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MjAwOTUyMDB9.u8MU3qcj4cMAr4xdjM5ogr7Z_pxdkc2h3VU3aQc2jHM"
 REFRESH_INTERVAL_SECONDS = 30 
 
@@ -128,7 +128,6 @@ def fetch_live_quotes_safe(instrument_keys, access_token):
                 time.sleep(0.5)
                 res_retry = requests.get(f"{url}?{encoded_params}", headers=headers, timeout=6)
                 if res_retry.status_code == 200:
-                    quotes_data.get('data', {})
                     quotes_data.update(res_retry.json().get('data', {}))
         except Exception as e:
             last_error = str(e)
@@ -139,15 +138,33 @@ def fetch_live_quotes_safe(instrument_keys, access_token):
     return quotes_data, last_error
 
 # ==========================================
-# 2. MULTI-STRIKE OPTION OI & VOLUME AGGREGATION
+# 2. POSITION BUILDER INTRA-DAY OI ACTIVITY ENGINE
 # ==========================================
-def fetch_and_calculate_oi_activity(mapped_df, fo_options_df, quotes_dict, access_token):
-    oi_scores = {}
-    if fo_options_df.empty or 'name' not in fo_options_df.columns or 'strike_price' not in fo_options_df.columns:
-        return oi_scores
+def fetch_intraday_candles_light(token, instrument_key):
+    if not instrument_key:
+        return pd.DataFrame()
+    encoded_key = urllib.parse.quote(str(instrument_key), safe="")
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/minutes/15"
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    try:
+        res = requests.get(url, headers=headers, timeout=4)
+        if res.status_code == 200:
+            candles = res.json().get("data", {}).get("candles", [])
+            if candles:
+                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+                return df
+    except Exception:
+        pass
+    return pd.DataFrame()
 
-    option_keys_to_fetch = []
-    symbol_to_near_keys = {}
+def calculate_position_builder_activity(mapped_df, fo_options_df, quotes_dict, access_token):
+    """
+    Computes true position building activity by analyzing net intraday OI changes 
+    across near-ATM strikes (Calls vs Puts), mirroring your position builder logic.
+    """
+    oi_multipliers = {}
+    if fo_options_df.empty or 'name' not in fo_options_df.columns or 'strike_price' not in fo_options_df.columns:
+        return oi_multipliers
 
     for _, row in mapped_df.iterrows():
         symbol = row['SYMBOL']
@@ -160,39 +177,40 @@ def fetch_and_calculate_oi_activity(mapped_df, fo_options_df, quotes_dict, acces
         if group.empty:
             continue
 
-        # Target near-ATM strikes (±2.5% range) across multiple strikes
-        near_strikes = group[(group['strike_price'] >= ltp * 0.975) & (group['strike_price'] <= ltp * 1.025)]
+        # Find near-ATM strikes (±2%)
+        near_strikes = group[(group['strike_price'] >= ltp * 0.98) & (group['strike_price'] <= ltp * 1.02)]
         if near_strikes.empty:
-            near_strikes = group.head(8)
+            near_strikes = group.head(4)
 
-        keys = near_strikes['instrument_key'].dropna().tolist()[:10] # Collect up to 10 option contracts per symbol
-        symbol_to_near_keys[symbol] = keys
-        option_keys_to_fetch.extend(keys)
+        ce_rows = near_strikes[near_strikes['trading_symbol'].astype(str).str.endswith("CE")][:3]
+        pe_rows = near_strikes[near_strikes['trading_symbol'].astype(str).str.endswith("PE")][:3]
 
-    option_quotes = {}
-    if option_keys_to_fetch:
-        option_keys_to_fetch = list(set(option_keys_to_fetch))
-        option_quotes, _ = fetch_live_quotes_safe(option_keys_to_fetch, access_token)
+        if ce_rows.empty or pe_rows.empty:
+            oi_multipliers[symbol] = 1.0
+            continue
 
-    for symbol, keys in symbol_to_near_keys.items():
-        total_activity_metric = 0.0
-        count = 0
-        for k in keys:
-            opt_q = option_quotes.get(k) or option_quotes.get(k.replace('|', ':')) or option_quotes.get(k.replace(':', '|')) or {}
-            
-            # Combine open interest and volume across multiple strikes to ensure active multiplier response
-            oi_val = float(opt_q.get('oi') or 0.0)
-            vol_val = float(opt_q.get('volume') or 0.0)
-            
-            total_activity_metric += (oi_val + (vol_val * 0.1))
-            count += 1
-            
-        avg_activity = (total_activity_metric / count) if count > 0 else 0.0
-        # Dynamic scaling factor (adjust divisor based on typical lot sizes/OI volumes)
-        multiplier = 1.0 + (avg_activity / 250000.0)
-        oi_scores[symbol] = max(1.0, min(2.5, multiplier))
+        # Fetch lightweight intraday OI data for active strike contracts
+        total_net_oi_activity = 0.0
+        active_contracts_checked = 0
 
-    return oi_scores
+        for _, opt_row in pd.concat([ce_rows, pe_rows]).iterrows():
+            opt_key = opt_row.get('instrument_key')
+            df_candle = fetch_intraday_candles_light(access_token, opt_key)
+            if not df_candle.empty and 'oi' in df_candle.columns:
+                # Sum of absolute OI shifts across candles represents position building magnitude
+                oi_diff_sum = df_candle['oi'].diff().abs().sum()
+                total_net_oi_activity += oi_diff_sum
+                active_contracts_checked += 1
+
+        if active_contracts_checked > 0:
+            avg_activity = total_net_oi_activity / active_contracts_checked
+            # Scale multiplier dynamically between 1.0x and 3.0x based on active OI volume
+            multiplier = 1.0 + min(2.0, avg_activity / 50000.0)
+            oi_multipliers[symbol] = round(multiplier, 2)
+        else:
+            oi_multipliers[symbol] = 1.0
+
+    return oi_multipliers
 
 def process_market_data(mapped_df, fo_options_df, quotes_dict, avg_10d_vol_dict, access_token):
     records = []
@@ -209,7 +227,8 @@ def process_market_data(mapped_df, fo_options_df, quotes_dict, avg_10d_vol_dict,
         if '|' in k:
             normalized_quotes[k.split('|')[1]] = v
 
-    oi_activity_map = fetch_and_calculate_oi_activity(mapped_df, fo_options_df, normalized_quotes, access_token)
+    # Calculate real position-building OI activity multipliers
+    oi_activity_map = calculate_position_builder_activity(mapped_df, fo_options_df, normalized_quotes, access_token)
 
     for _, row in mapped_df.iterrows():
         key = row['instrument_key']
