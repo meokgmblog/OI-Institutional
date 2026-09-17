@@ -21,7 +21,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FNO_EXCEL_PATH = os.path.join(BASE_DIR, "FNO all list.xlsx")
 INSTRUMENTS_CSV_PATH = os.path.join(BASE_DIR, "instruments.csv")
 
-ACCESS_TOKEN = st.secrets.get("ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJIWjYwMzgiLCJqdGkiOiI2YTlhNTdlYmRmZmFlZTE4YjlhZWEwODEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzg4NDk5OTQ3LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MjAwOTUyMDB9.u8MU3qcj4cMAr4xdjM5ogr7Z_pxdkc2h3VU3aQc2jHM")
+ACCESS_TOKEN = st.secrets.get("ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI2M0FZSEUiLCJqdGkiOiJ2YTMwY2UxNTY4ODI0Zjc3ZDc1NmU3NjgiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4MTU4MzM4MSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODEzMTgzMjAwfQ.IoRDQhbhcn3w9Fkw75N3eBSamLcaA8GcAhVjf5K-iL8")
 REFRESH_INTERVAL_SECONDS = 30 
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
@@ -36,7 +36,6 @@ if not os.path.exists(FNO_EXCEL_PATH) or not os.path.exists(INSTRUMENTS_CSV_PATH
 # FORMATTING HELPERS
 # ==========================================
 def format_volume(vol):
-    """Formats raw volume into standard K/M units."""
     if vol >= 1_000_000:
         return f"{vol / 1_000_000:.2f}M"
     elif vol >= 1_000:
@@ -44,7 +43,6 @@ def format_volume(vol):
     return str(int(vol))
 
 def format_signed_pct(val):
-    """Formats percentage with explicit + / - signs."""
     return f"+{val:.2f}%" if val > 0 else f"{val:.2f}%"
 
 # ==========================================
@@ -60,7 +58,6 @@ def load_instrument_mapping(excel_path, csv_path):
     
     merged = pd.merge(fno_clean, nse_eq, left_on='SYMBOL', right_on='trading_symbol', how='inner')
     
-    # Safely extract options if columns exist
     fo_options = pd.DataFrame()
     if 'segment' in inst_df.columns and 'instrument_type' in inst_df.columns:
         fo_options = inst_df[(inst_df['segment'] == 'NSE_FO') & (inst_df['instrument_type'].isin(['CE', 'PE']))].copy()
@@ -72,7 +69,7 @@ def _fetch_single_10d_vol(key, access_token, to_date, from_date):
     encoded_key = urllib.parse.quote(key, safe='|:')
     url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
     
-    for attempt in range(2):
+    for _ in range(2):
         try:
             res = requests.get(url, headers=headers, timeout=4)
             if res.status_code == 200:
@@ -140,55 +137,65 @@ def fetch_live_quotes_safe(instrument_keys, access_token):
     return quotes_data, last_error
 
 # ==========================================
-# 2. SAFE OPTION OI ACTIVITY SCORING
+# 2. DYNAMIC OPTION OI ACTIVITY FETCH & SCORING
 # ==========================================
-def calculate_oi_activity_scores(mapped_df, fo_options_df, quotes_dict):
+def fetch_and_calculate_oi_activity(mapped_df, fo_options_df, quotes_dict, access_token):
     """
-    Safely computes an OI activity score with robust fallbacks.
+    Identifies near-ATM option contracts based on live equity LTPs, 
+    fetches their live option quotes, and calculates real OI activity multipliers.
     """
     oi_scores = {}
-    if fo_options_df.empty or 'name' not in fo_options_df.columns:
+    if fo_options_df.empty or 'name' not in fo_options_df.columns or 'strike_price' not in fo_options_df.columns:
         return oi_scores
 
-    symbol_set = set(mapped_df['SYMBOL'])
-    active_options = fo_options_df[fo_options_df['name'].isin(symbol_set)].copy()
-    
-    if active_options.empty:
-        return oi_scores
+    option_keys_to_fetch = []
+    symbol_to_near_keys = {}
 
-    try:
-        for symbol, group in active_options.groupby('name'):
-            quote = quotes_dict.get(f"NSE_EQ:{symbol}") or quotes_dict.get(f"NSE_EQ|{symbol}") or {}
-            ltp = float(quote.get('last_price') or 0.0)
-            if ltp <= 0:
-                oi_scores[symbol] = 1.0
-                continue
+    for _, row in mapped_df.iterrows():
+        symbol = row['SYMBOL']
+        quote = quotes_dict.get(f"NSE_EQ:{symbol}") or quotes_dict.get(f"NSE_EQ|{symbol}") or quotes_dict.get(symbol) or {}
+        ltp = float(quote.get('last_price') or 0.0)
+        if ltp <= 0:
+            continue
+
+        # Filter options belonging to this symbol within ±3% of current LTP
+        group = fo_options_df[fo_options_df['name'] == symbol]
+        if group.empty:
+            continue
+
+        near_strikes = group[(group['strike_price'] >= ltp * 0.97) & (group['strike_price'] <= ltp * 1.03)]
+        if near_strikes.empty:
+            near_strikes = group.head(6)
+
+        keys = near_strikes['instrument_key'].dropna().tolist()[:6] # Limit to 6 contracts per stock to respect API limits
+        symbol_to_near_keys[symbol] = keys
+        option_keys_to_fetch.extend(keys)
+
+    # Fetch option quotes in batch
+    option_quotes = {}
+    if option_keys_to_fetch:
+        # Deduplicate keys
+        option_keys_to_fetch = list(set(option_keys_to_fetch))
+        option_quotes, _ = fetch_live_quotes_safe(option_keys_to_fetch, access_token)
+
+    # Compute score per symbol
+    for symbol, keys in symbol_to_near_keys.items():
+        total_oi_change_abs = 0.0
+        count = 0
+        for k in keys:
+            opt_q = option_quotes.get(k) or option_quotes.get(k.replace('|', ':')) or option_quotes.get(k.replace(':', '|')) or {}
+            # Upstox returns OI change under 'oi_change' or 'net_change_oi'
+            oi_change = abs(float(opt_q.get('oi_change') or opt_q.get('net_change_oi') or 0.0))
+            total_oi_change_abs += oi_change
+            count += 1
             
-            if 'strike_price' in group.columns:
-                near_strikes = group[(group['strike_price'] >= ltp * 0.97) & (group['strike_price'] <= ltp * 1.03)]
-                if near_strikes.empty:
-                    near_strikes = group.head(10)
-            else:
-                near_strikes = group.head(10)
-                
-            opt_keys = near_strikes['instrument_key'].tolist()[:8] if 'instrument_key' in near_strikes.columns else []
-            
-            total_oi_change_abs = 0.0
-            count = 0
-            for k in opt_keys:
-                opt_q = quotes_dict.get(k) or quotes_dict.get(k.replace('|', ':')) or quotes_dict.get(k.replace(':', '|')) or {}
-                oi_change = abs(float(opt_q.get('oi_change') or opt_q.get('net_change_oi') or 0.0))
-                total_oi_change_abs += oi_change
-                count += 1
-                
-            score = (total_oi_change_abs / count) if count > 0 else 0.0
-            oi_scores[symbol] = max(1.0, min(3.0, 1.0 + (score / 5000.0)))
-    except Exception:
-        pass  # Fallback gracefully if any unexpected schema quirk occurs
-        
+        score = (total_oi_change_abs / count) if count > 0 else 0.0
+        # Scale multiplier between 1.0x and 3.0x based on option open interest shift magnitude
+        oi_scores[symbol] = max(1.0, min(3.0, 1.0 + (score / 15000.0)))
+
     return oi_scores
 
-def process_market_data(mapped_df, fo_options_df, quotes_dict, avg_10d_vol_dict):
+def process_market_data(mapped_df, fo_options_df, quotes_dict, avg_10d_vol_dict, access_token):
     records = []
     if not quotes_dict:
         return pd.DataFrame()
@@ -203,8 +210,8 @@ def process_market_data(mapped_df, fo_options_df, quotes_dict, avg_10d_vol_dict)
         if '|' in k:
             normalized_quotes[k.split('|')[1]] = v
 
-    # Calculate OI activity multiplier scores safely
-    oi_activity_map = calculate_oi_activity_scores(mapped_df, fo_options_df, normalized_quotes)
+    # Fetch live option quotes and compute real OI activity multipliers
+    oi_activity_map = fetch_and_calculate_oi_activity(mapped_df, fo_options_df, normalized_quotes, access_token)
 
     for _, row in mapped_df.iterrows():
         key = row['instrument_key']
@@ -248,7 +255,6 @@ def process_market_data(mapped_df, fo_options_df, quotes_dict, avg_10d_vol_dict)
         vwap_dist = ((ltp - vwap) / vwap * 100) if vwap > 0 else 0.0
         flow_ratio = (buy_qty / sell_qty) if sell_qty > 0 else (1.5 if buy_qty > 0 else 1.0)
         
-        # Incorporate Live OI Activity Score multiplier
         oi_multiplier = oi_activity_map.get(symbol, 1.0)
         
         inst_score = (p_change + (vwap_dist * 0.8) + ((flow_ratio - 1) * 2) + ((vol_ratio_capped - 1) * 0.5)) * oi_multiplier
@@ -311,7 +317,7 @@ def dashboard_live_loop():
     if market_status:
         st.success(f"🟢 **MARKET LIVE** — Last Updated: {now_str}")
         quotes, api_error = fetch_live_quotes_safe(unique_keys, ACCESS_TOKEN)
-        data_df = process_market_data(mapped_df, fo_options_df, quotes, avg_10d_vols)
+        data_df = process_market_data(mapped_df, fo_options_df, quotes, avg_10d_vols, ACCESS_TOKEN)
         
         if not data_df.empty:
             st.session_state['frozen_df'] = data_df
@@ -326,7 +332,7 @@ def dashboard_live_loop():
         else:
             st.warning(f"🔴 **MARKET CLOSED** — Fetching final snapshot. Current time: {now_str}")
             quotes, api_error = fetch_live_quotes_safe(unique_keys, ACCESS_TOKEN)
-            data_df = process_market_data(mapped_df, fo_options_df, quotes, avg_10d_vols)
+            data_df = process_market_data(mapped_df, fo_options_df, quotes, avg_10d_vols, ACCESS_TOKEN)
             if not data_df.empty:
                 st.session_state['frozen_df'] = data_df
                 st.session_state['frozen_time'] = now_str
