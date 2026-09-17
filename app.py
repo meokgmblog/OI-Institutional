@@ -21,7 +21,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FNO_EXCEL_PATH = os.path.join(BASE_DIR, "FNO all list.xlsx")
 INSTRUMENTS_CSV_PATH = os.path.join(BASE_DIR, "instruments.csv")
 
-ACCESS_TOKEN = st.secrets.get("ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJIWjYwMzgiLCJqdGkiOiI2YTlhNTdlYmRmZmFlZTE4YjlhZWEwODEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzg4NDk5OTQ3LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MjAwOTUyMDB9.u8MU3qcj4cMAr4xdjM5ogr7Z_pxdkc2h3VU3aQc2jHM")
+# Updated access token provided by user
+ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJIWjYwMzgiLCJqdGkiOiI2YTlhNTdlYmRmZmFlZTE4YjlhZWEwODEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzg4NDk5OTQ3LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MjAwOTUyMDB9.u8MU3qcj4cMAr4xdjM5ogr7Z_pxdkc2h3VU3aQc2jHM"
 REFRESH_INTERVAL_SECONDS = 30 
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
@@ -127,6 +128,7 @@ def fetch_live_quotes_safe(instrument_keys, access_token):
                 time.sleep(0.5)
                 res_retry = requests.get(f"{url}?{encoded_params}", headers=headers, timeout=6)
                 if res_retry.status_code == 200:
+                    quotes_data.get('data', {})
                     quotes_data.update(res_retry.json().get('data', {}))
         except Exception as e:
             last_error = str(e)
@@ -137,13 +139,9 @@ def fetch_live_quotes_safe(instrument_keys, access_token):
     return quotes_data, last_error
 
 # ==========================================
-# 2. DYNAMIC OPTION OI ACTIVITY FETCH & SCORING
+# 2. MULTI-STRIKE OPTION OI & VOLUME AGGREGATION
 # ==========================================
 def fetch_and_calculate_oi_activity(mapped_df, fo_options_df, quotes_dict, access_token):
-    """
-    Identifies near-ATM option contracts based on live equity LTPs, 
-    fetches their live option quotes, and calculates real OI activity multipliers.
-    """
     oi_scores = {}
     if fo_options_df.empty or 'name' not in fo_options_df.columns or 'strike_price' not in fo_options_df.columns:
         return oi_scores
@@ -158,40 +156,41 @@ def fetch_and_calculate_oi_activity(mapped_df, fo_options_df, quotes_dict, acces
         if ltp <= 0:
             continue
 
-        # Filter options belonging to this symbol within ±3% of current LTP
         group = fo_options_df[fo_options_df['name'] == symbol]
         if group.empty:
             continue
 
-        near_strikes = group[(group['strike_price'] >= ltp * 0.97) & (group['strike_price'] <= ltp * 1.03)]
+        # Target near-ATM strikes (±2.5% range) across multiple strikes
+        near_strikes = group[(group['strike_price'] >= ltp * 0.975) & (group['strike_price'] <= ltp * 1.025)]
         if near_strikes.empty:
-            near_strikes = group.head(6)
+            near_strikes = group.head(8)
 
-        keys = near_strikes['instrument_key'].dropna().tolist()[:6] # Limit to 6 contracts per stock to respect API limits
+        keys = near_strikes['instrument_key'].dropna().tolist()[:10] # Collect up to 10 option contracts per symbol
         symbol_to_near_keys[symbol] = keys
         option_keys_to_fetch.extend(keys)
 
-    # Fetch option quotes in batch
     option_quotes = {}
     if option_keys_to_fetch:
-        # Deduplicate keys
         option_keys_to_fetch = list(set(option_keys_to_fetch))
         option_quotes, _ = fetch_live_quotes_safe(option_keys_to_fetch, access_token)
 
-    # Compute score per symbol
     for symbol, keys in symbol_to_near_keys.items():
-        total_oi_change_abs = 0.0
+        total_activity_metric = 0.0
         count = 0
         for k in keys:
             opt_q = option_quotes.get(k) or option_quotes.get(k.replace('|', ':')) or option_quotes.get(k.replace(':', '|')) or {}
-            # Upstox returns OI change under 'oi_change' or 'net_change_oi'
-            oi_change = abs(float(opt_q.get('oi_change') or opt_q.get('net_change_oi') or 0.0))
-            total_oi_change_abs += oi_change
+            
+            # Combine open interest and volume across multiple strikes to ensure active multiplier response
+            oi_val = float(opt_q.get('oi') or 0.0)
+            vol_val = float(opt_q.get('volume') or 0.0)
+            
+            total_activity_metric += (oi_val + (vol_val * 0.1))
             count += 1
             
-        score = (total_oi_change_abs / count) if count > 0 else 0.0
-        # Scale multiplier between 1.0x and 3.0x based on option open interest shift magnitude
-        oi_scores[symbol] = max(1.0, min(3.0, 1.0 + (score / 15000.0)))
+        avg_activity = (total_activity_metric / count) if count > 0 else 0.0
+        # Dynamic scaling factor (adjust divisor based on typical lot sizes/OI volumes)
+        multiplier = 1.0 + (avg_activity / 250000.0)
+        oi_scores[symbol] = max(1.0, min(2.5, multiplier))
 
     return oi_scores
 
@@ -210,7 +209,6 @@ def process_market_data(mapped_df, fo_options_df, quotes_dict, avg_10d_vol_dict,
         if '|' in k:
             normalized_quotes[k.split('|')[1]] = v
 
-    # Fetch live option quotes and compute real OI activity multipliers
     oi_activity_map = fetch_and_calculate_oi_activity(mapped_df, fo_options_df, normalized_quotes, access_token)
 
     for _, row in mapped_df.iterrows():
